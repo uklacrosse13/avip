@@ -7,7 +7,6 @@ import io
 import math
 from datetime import datetime
 
-# PDF via reportlab
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors as rl_colors
@@ -15,9 +14,8 @@ from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
                                  Paragraph, Spacer, HRFlowable)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AVIP – Athlete Value Intelligence Platform",
     page_icon="🏆",
@@ -32,6 +30,7 @@ st.markdown("""
   .tier-high   { background:#dbeafe;color:#1e40af;padding:4px 12px;border-radius:99px;font-weight:600;font-size:13px; }
   .tier-dev    { background:#fef3c7;color:#92400e;padding:4px 12px;border-radius:99px;font-weight:600;font-size:13px; }
   .tier-entry  { background:#fee2e2;color:#991b1b;padding:4px 12px;border-radius:99px;font-weight:600;font-size:13px; }
+  .bluechip    { background:#f3e8ff;color:#6b21a8;padding:4px 12px;border-radius:99px;font-weight:600;font-size:13px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -44,7 +43,8 @@ SIZE_MAP       = {"20,000+": 3, "8,000–20,000": 2, "Under 8,000": 1}
 TV_MAP         = {"National (ESPN, Fox)": 3, "Regional network": 2, "Streaming / local only": 1}
 MKT_MAP        = {"Top-25 DMA": 3, "Mid-size market": 2, "Small market": 1}
 TRANSFER_MAP   = {"Low — committed": 0, "Medium": 1, "High — exploring portal": 2}
-DRAFT_MAP      = {"3+ years remaining": 0, "1–2 years remaining": 1, "Draft-eligible now": 2}
+DRAFT_MAP      = {"0 — Not projected": 0, "3 — 2nd round proj.": 3, "2 — Late 1st rd (15-30)": 2, "1 — Lottery pick (1-14)": 1}
+RECRUIT_MAP    = {"Unranked": 0, "Top 300": 250, "Top 100": 75, "Top 30": 20, "Top 10": 5}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCORING ENGINE
@@ -78,14 +78,40 @@ def retention_risk(transfer_val, draft_val):
 def overall_score(ath, soc, mkt, risk):
     return round(ath * 0.35 + soc * 0.30 + mkt * 0.25 + (100 - risk) * 0.10)
 
-def nil_range(ath, soc, mkt, risk):
+def nil_range(ath, soc, mkt, risk, recruit_rank=0, draft_round=0):
+    """
+    recruit_rank: national ranking number (5 = top 5, 0 = unranked)
+    draft_round:  1=Lottery, 2=Late 1st, 3=2nd round, 0=undrafted
+    """
     base = (ath * 0.35 + soc * 0.30 + mkt * 0.25) * (1 - risk / 200)
-    # Exponential scale: Entry ~$1-3k | Developing ~$4-12k | High ~$12-50k | Elite ~$50-150k+
-    lo = max(1000, round((math.exp(base / 18) - 1) * 800 / 1000) * 1000)
+
+    # Base NIL — calibrated so avg D1 starter = $10–50k
+    lo = max(1000, round((math.exp(base / 22) - 1) * 600 / 1000) * 1000)
+
+    # Blue Chip recruiting multiplier
+    if 1 <= recruit_rank <= 10:    recruit_mult = 25.0
+    elif recruit_rank <= 30:        recruit_mult = 14.0
+    elif recruit_rank <= 100:       recruit_mult = 5.0
+    elif recruit_rank <= 300:       recruit_mult = 2.0
+    else:                           recruit_mult = 1.0
+
+    # Draft projection multiplier
+    if draft_round == 1:            draft_mult = 18.0
+    elif draft_round == 2:          draft_mult = 8.0
+    elif draft_round == 3:          draft_mult = 3.0
+    else:                           draft_mult = 1.0
+
+    primary   = max(recruit_mult, draft_mult)
+    secondary = min(recruit_mult, draft_mult)
+    combined  = 1 + (primary - 1) + (secondary - 1) * 0.35
+
+    lo = round(lo * combined / 1000) * 1000
     hi = round(lo * 1.75 / 1000) * 1000
     return lo, hi
 
-def tier_label(score):
+def tier_label(score, recruit_rank=0, draft_round=0):
+    if (recruit_rank > 0 and recruit_rank <= 30) or draft_round == 1:
+        return "Blue Chip"
     if score >= 80: return "Elite"
     if score >= 60: return "High Value"
     if score >= 40: return "Developing"
@@ -100,12 +126,15 @@ def score_row(player: dict) -> dict:
     mkt  = market_score(player.get("mSize",2), player.get("mTV",2), player.get("mMkt",2))
     risk = retention_risk(player.get("rTransfer",0), player.get("rDraft",0))
     ovr  = overall_score(ath, soc, mkt, risk)
-    lo, hi = nil_range(ath, soc, mkt, risk)
+    rrank  = player.get("recruit_rank", 0)
+    dround = player.get("draft_round", 0)
+    lo, hi = nil_range(ath, soc, mkt, risk, rrank, dround)
+    t = tier_label(ovr, rrank, dround)
     return {**player, "ath":ath, "soc":soc, "mkt":mkt, "risk":risk,
-            "overall":ovr, "nil_lo":lo, "nil_hi":hi, "tier":tier_label(ovr)}
+            "overall":ovr, "nil_lo":lo, "nil_hi":hi, "tier":t}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PDF EXPORT (reportlab)
+# PDF EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_pdf(p: dict) -> bytes:
@@ -115,116 +144,119 @@ def build_pdf(p: dict) -> bytes:
                             topMargin=0.75*inch, bottomMargin=0.75*inch)
     styles = getSampleStyleSheet()
     W = letter[0] - 1.5*inch
-
     BLUE  = rl_colors.HexColor("#185FA5")
     LBLUE = rl_colors.HexColor("#E6F1FB")
     LGRAY = rl_colors.HexColor("#F1EFE8")
     DARK  = rl_colors.HexColor("#1a1a1a")
     MID   = rl_colors.HexColor("#555555")
+    PURP  = rl_colors.HexColor("#6b21a8")
 
-    h1 = ParagraphStyle("h1", parent=styles["Normal"], fontSize=20, fontName="Helvetica-Bold",
-                         textColor=DARK, spaceAfter=2)
-    h2 = ParagraphStyle("h2", parent=styles["Normal"], fontSize=13, fontName="Helvetica-Bold",
-                         textColor=BLUE, spaceBefore=12, spaceAfter=4)
-    sub = ParagraphStyle("sub", parent=styles["Normal"], fontSize=10, textColor=MID, spaceAfter=6)
-    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=9, textColor=DARK,
-                           leading=14, spaceAfter=4)
-    foot = ParagraphStyle("foot", parent=styles["Normal"], fontSize=8, textColor=MID,
-                           alignment=TA_CENTER)
+    h1   = ParagraphStyle("h1",  parent=styles["Normal"], fontSize=20, fontName="Helvetica-Bold", textColor=DARK, spaceAfter=2)
+    h2   = ParagraphStyle("h2",  parent=styles["Normal"], fontSize=13, fontName="Helvetica-Bold", textColor=BLUE, spaceBefore=12, spaceAfter=4)
+    sub  = ParagraphStyle("sub", parent=styles["Normal"], fontSize=10, textColor=MID, spaceAfter=6)
+    body = ParagraphStyle("body",parent=styles["Normal"], fontSize=9,  textColor=DARK, leading=14, spaceAfter=4)
+    foot = ParagraphStyle("foot",parent=styles["Normal"], fontSize=8,  textColor=MID, alignment=TA_CENTER)
 
     story = []
 
-    # ── Header banner ──
     banner_data = [[Paragraph(
         f'<font color="white" size="14"><b>AVIP — Athlete Value Intelligence Report</b></font><br/>'
-        f'<font color="#B5D4F4" size="8">Generated {datetime.now().strftime("%B %d, %Y")}  ·  Confidential — For Internal AD Use Only</font>',
-        ParagraphStyle("banner", fontSize=14, fontName="Helvetica-Bold", textColor=rl_colors.white, alignment=TA_LEFT)
+        f'<font color="#B5D4F4" size="8">Generated {datetime.now().strftime("%B %d, %Y")}  ·  Confidential</font>',
+        ParagraphStyle("banner", fontSize=14, fontName="Helvetica-Bold",
+                       textColor=rl_colors.white, alignment=TA_LEFT)
     )]]
     banner = Table(banner_data, colWidths=[W])
     banner.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), BLUE),
-        ("TOPPADDING",    (0,0),(-1,-1), 12),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 12),
-        ("LEFTPADDING",   (0,0),(-1,-1), 16),
+        ("BACKGROUND",(0,0),(-1,-1),BLUE),
+        ("TOPPADDING",(0,0),(-1,-1),12),("BOTTOMPADDING",(0,0),(-1,-1),12),
+        ("LEFTPADDING",(0,0),(-1,-1),16),
     ]))
     story.append(banner)
     story.append(Spacer(1, 12))
 
-    # ── Player header ──
     story.append(Paragraph(p.get("name","Athlete"), h1))
-    sub_text = "  ·  ".join(filter(None, [p.get("pos",""), p.get("sport",""),
-                                           p.get("year",""), p.get("school","")]))
+    sub_text = "  ·  ".join(filter(None,[p.get("pos",""),p.get("sport",""),p.get("year",""),p.get("school","")]))
     story.append(Paragraph(sub_text, sub))
 
-    # ── Tier + Overall box ──
+    tier_color = PURP if p["tier"]=="Blue Chip" else BLUE
     ovr_data = [
-        [Paragraph(f'<b>Overall Score</b>', body),
-         Paragraph(f'<b>Tier</b>', body),
-         Paragraph(f'<b>Est. NIL Value / yr</b>', body)],
-        [Paragraph(f'<font size="18"><b>{p["overall"]}/100</b></font>', ParagraphStyle("big", fontSize=18, fontName="Helvetica-Bold", textColor=BLUE)),
-         Paragraph(f'<font size="14"><b>{p["tier"]}</b></font>', ParagraphStyle("tier", fontSize=14, fontName="Helvetica-Bold", textColor=DARK)),
-         Paragraph(f'<font size="14"><b>${p["nil_lo"]:,} – ${p["nil_hi"]:,}</b></font>', ParagraphStyle("nil", fontSize=14, fontName="Helvetica-Bold", textColor=BLUE))],
+        [Paragraph("<b>Overall Score</b>",body), Paragraph("<b>Tier</b>",body),
+         Paragraph("<b>Est. NIL Value / yr</b>",body), Paragraph("<b>Blue Chip Factors</b>",body)],
+        [Paragraph(f'<font size="16"><b>{p["overall"]}/100</b></font>',
+                   ParagraphStyle("big",fontSize=16,fontName="Helvetica-Bold",textColor=BLUE)),
+         Paragraph(f'<font size="13"><b>{p["tier"]}</b></font>',
+                   ParagraphStyle("tier",fontSize=13,fontName="Helvetica-Bold",textColor=tier_color)),
+         Paragraph(f'<font size="13"><b>${p["nil_lo"]:,} – ${p["nil_hi"]:,}</b></font>',
+                   ParagraphStyle("nil",fontSize=13,fontName="Helvetica-Bold",textColor=BLUE)),
+         Paragraph(
+             f'Recruiting: {_rank_label(p.get("recruit_rank",0))}<br/>'
+             f'Draft proj: {_draft_label(p.get("draft_round",0))}',
+             ParagraphStyle("bc",fontSize=9,textColor=DARK,leading=14)
+         )],
     ]
-    ovr_tbl = Table(ovr_data, colWidths=[W*0.25, W*0.25, W*0.5])
+    ovr_tbl = Table(ovr_data, colWidths=[W*0.18,W*0.18,W*0.32,W*0.32])
     ovr_tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), LBLUE),
-        ("GRID",       (0,0), (-1,-1), 0.5, rl_colors.HexColor("#B5D4F4")),
-        ("TOPPADDING",    (0,0),(-1,-1), 10),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 10),
-        ("LEFTPADDING",   (0,0),(-1,-1), 12),
+        ("BACKGROUND",(0,0),(-1,-1),LBLUE),
+        ("GRID",(0,0),(-1,-1),0.5,rl_colors.HexColor("#B5D4F4")),
+        ("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8),
+        ("LEFTPADDING",(0,0),(-1,-1),10),
     ]))
     story.append(ovr_tbl)
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1,12))
 
-    # ── Score breakdown table ──
     story.append(Paragraph("Score Breakdown", h2))
-    score_headers = ["Dimension", "Score", "Weight", "Tier Driver"]
-    score_rows = [
+    tbl_data = [["Dimension","Score","Weight","Key Inputs"]] + [
         ("Athletic Performance", p["ath"],       "35%", "Stars · Start rate · Awards · Conference"),
         ("Social Media Reach",   p["soc"],       "30%", "Followers × engagement (log-scaled)"),
         ("Market Opportunity",   p["mkt"],       "25%", "School size · TV exposure · DMA market"),
         ("Retention (inverted)", 100-p["risk"],  "10%", "Transfer risk · Draft eligibility"),
     ]
-    tbl_data = [score_headers] + [[r[0], str(r[1]), r[2], r[3]] for r in score_rows]
-    score_tbl = Table(tbl_data, colWidths=[W*0.30, W*0.10, W*0.10, W*0.50])
+    score_tbl = Table(tbl_data, colWidths=[W*0.30,W*0.10,W*0.10,W*0.50])
     score_tbl.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,0),  BLUE),
-        ("TEXTCOLOR",     (0,0), (-1,0),  rl_colors.white),
-        ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
-        ("FONTSIZE",      (0,0), (-1,-1), 9),
-        ("ROWBACKGROUNDS",(0,1), (-1,-1), [rl_colors.white, LGRAY]),
-        ("GRID",          (0,0), (-1,-1), 0.4, rl_colors.HexColor("#D3D1C7")),
-        ("ALIGN",         (1,0), (2,-1),  "CENTER"),
-        ("TOPPADDING",    (0,0),(-1,-1),  6),
-        ("BOTTOMPADDING", (0,0),(-1,-1),  6),
-        ("LEFTPADDING",   (0,0),(-1,-1),  8),
+        ("BACKGROUND",(0,0),(-1,0),BLUE),("TEXTCOLOR",(0,0),(-1,0),rl_colors.white),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),9),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[rl_colors.white,LGRAY]),
+        ("GRID",(0,0),(-1,-1),0.4,rl_colors.HexColor("#D3D1C7")),
+        ("ALIGN",(1,0),(2,-1),"CENTER"),
+        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ("LEFTPADDING",(0,0),(-1,-1),8),
     ]))
     story.append(score_tbl)
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1,12))
 
-    # ── Insights ──
-    story.append(Paragraph("Athletic Department Insights", h2))
+    story.append(Paragraph("Key Insights", h2))
     total_soc = p.get("ig",0)+p.get("tt",0)+p.get("xf",0)
     start_rate = round(p.get("starts",0)/max(p.get("games",1),1)*100)
     cap_pct = p["nil_hi"]/20_500_000*100
     insights = [
+        f"<b>NIL Estimate Basis:</b> Fair-market floor. Bidding-war premiums (e.g. competitive recruiting) may push actual deals higher.",
+        f"<b>Blue Chip Factors:</b> Recruiting rank: {_rank_label(p.get('recruit_rank',0))} · Draft projection: {_draft_label(p.get('draft_round',0))}",
         f"<b>Social Reach:</b> {total_soc:,} total followers with {p.get('eng',0):.1f}% avg engagement rate",
         f"<b>Start Rate:</b> {start_rate}% ({p.get('starts',0)} starts / {p.get('games',0)} games)",
-        f"<b>Transfer Risk:</b> {['Low — prioritize retention incentives','Medium — evaluate collective engagement','High — immediate NIL conversation recommended'][p.get('rTransfer',0)]}",
-        f"<b>Draft Exposure:</b> {['Minimal','Moderate — monitor draft boards','High — timeline accelerated'][p.get('rDraft',0)]}",
-        f"<b>Revenue-Share Context:</b> Estimated value represents ~{cap_pct:.2f}% of the $20.5M House settlement cap",
+        f"<b>Transfer Risk:</b> {['Low — prioritize retention','Medium — evaluate collective engagement','High — immediate NIL conversation needed'][p.get('rTransfer',0)]}",
+        f"<b>Revenue-Share Context:</b> ~{cap_pct:.2f}% of the $20.5M House settlement cap",
         f"<b>Compliance:</b> All NIL agreements must document fair market value with proof of services rendered.",
     ]
     for ins in insights:
         story.append(Paragraph(f"• {ins}", body))
 
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1,10))
     story.append(HRFlowable(width=W, thickness=0.5, color=rl_colors.HexColor("#D3D1C7")))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph("AVIP · Confidential — For Internal Athletic Department Use Only · Not for public distribution", foot))
+    story.append(Spacer(1,6))
+    story.append(Paragraph("AVIP · Confidential — For Internal Athletic Department Use Only", foot))
 
     doc.build(story)
     return buf.getvalue()
+
+def _rank_label(r):
+    if r == 0: return "Unranked"
+    if r <= 10: return f"Top 10 (#{r})"
+    if r <= 30: return f"Top 30 (#{r})"
+    if r <= 100: return f"Top 100 (#{r})"
+    return f"Top 300 (#{r})"
+
+def _draft_label(d):
+    return ["Not projected","Lottery pick (1-14)","Late 1st round (15-30)","2nd round"][min(d,3)]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV TEMPLATE
@@ -235,14 +267,14 @@ COLUMNS = [
     "games","starts","stars","awards","conference",
     "ig_followers","tiktok_followers","twitter_followers","engagement_pct",
     "school_size","tv_exposure","market_size",
-    "transfer_risk","draft_risk",
+    "transfer_risk","draft_risk","national_recruiting_rank","draft_projection",
 ]
 SAMPLE_DATA = [
-    ["Marcus Hill","Univ. of Missouri","Football","WR","Junior",12,10,4,"Conference Award","Power 4",18000,25000,4500,5.2,"20,000+","National (ESPN, Fox)","Top-25 DMA","Low — committed","1–2 years remaining"],
-    ["Deja Williams","SLU","Basketball","PG","Senior",28,26,3,"None","Mid-Major",9000,12000,2200,7.8,"8,000–20,000","Regional network","Mid-size market","Medium","3+ years remaining"],
-    ["Carlos Reyes","SIUE","Baseball","SP","Sophomore",18,15,2,"Team Award","D-II / D-III / NAIA",3000,5000,800,3.1,"8,000–20,000","Streaming / local only","Mid-size market","Low — committed","3+ years remaining"],
-    ["Amara Knox","Mizzou","Soccer","FW","Junior",20,18,4,"Conference Award","Power 4",22000,30000,5500,6.4,"20,000+","National (ESPN, Fox)","Top-25 DMA","Low — committed","3+ years remaining"],
-    ["Tyler Rhodes","UMSL","Basketball","SG","Senior",24,20,3,"Team Award","D-II / D-III / NAIA",5500,8000,1200,4.1,"8,000–20,000","Streaming / local only","Mid-size market","High — exploring portal","3+ years remaining"],
+    ["Marcus Hill","Univ. of Missouri","Football","WR","Junior",12,10,4,"Conference Award","Power 4",18000,25000,4500,5.2,"20,000+","National (ESPN, Fox)","Top-25 DMA","Low — committed","0 — Not projected","Unranked","0 — Not projected"],
+    ["Deja Williams","SLU","Basketball","PG","Senior",28,26,3,"None","Mid-Major",9000,12000,2200,7.8,"8,000–20,000","Regional network","Mid-size market","Medium","0 — Not projected","Unranked","0 — Not projected"],
+    ["Carlos Reyes","SIUE","Baseball","SP","Sophomore",18,15,2,"Team Award","D-II / D-III / NAIA",3000,5000,800,3.1,"8,000–20,000","Streaming / local only","Mid-size market","Low — committed","0 — Not projected","Unranked","0 — Not projected"],
+    ["Amara Knox","Mizzou","Soccer","FW","Junior",20,18,4,"Conference Award","Power 4",22000,30000,5500,6.4,"20,000+","National (ESPN, Fox)","Top-25 DMA","Low — committed","0 — Not projected","Top 100","2 — Late 1st rd (15-30)"],
+    ["Milan Momcilovic","Sacramento Kings","Basketball","SF","Freshman",30,28,5,"All-American / National","Power 4",150000,200000,45000,6.8,"20,000+","National (ESPN, Fox)","Top-25 DMA","Low — committed","1 — Lottery pick (1-14)","Top 10","1 — Lottery pick (1-14)"],
 ]
 
 def csv_row_to_player(row) -> dict:
@@ -253,25 +285,27 @@ def csv_row_to_player(row) -> dict:
         try: return float(v)
         except: return d
     return {
-        "name":      str(row.get("name","Athlete")),
-        "school":    str(row.get("school","")),
-        "sport":     str(row.get("sport","")),
-        "pos":       str(row.get("position","")),
-        "year":      str(row.get("year","")),
-        "games":     safe_int(row.get("games",10)),
-        "starts":    safe_int(row.get("starts",8)),
-        "stars":     safe_int(row.get("stars",3)),
-        "awards_val":AWARD_MAP.get(str(row.get("awards","None")), 0),
-        "conf_val":  CONF_TIER_MAP.get(str(row.get("conference","Mid-Major")), 2),
-        "ig":        safe_int(row.get("ig_followers",0)),
-        "tt":        safe_int(row.get("tiktok_followers",0)),
-        "xf":        safe_int(row.get("twitter_followers",0)),
-        "eng":       safe_float(row.get("engagement_pct",2.0)),
-        "mSize":     SIZE_MAP.get(str(row.get("school_size","8,000–20,000")), 2),
-        "mTV":       TV_MAP.get(str(row.get("tv_exposure","Regional network")), 2),
-        "mMkt":      MKT_MAP.get(str(row.get("market_size","Mid-size market")), 2),
-        "rTransfer": TRANSFER_MAP.get(str(row.get("transfer_risk","Low — committed")), 0),
-        "rDraft":    DRAFT_MAP.get(str(row.get("draft_risk","3+ years remaining")), 0),
+        "name":       str(row.get("name","Athlete")),
+        "school":     str(row.get("school","")),
+        "sport":      str(row.get("sport","")),
+        "pos":        str(row.get("position","")),
+        "year":       str(row.get("year","")),
+        "games":      safe_int(row.get("games",10)),
+        "starts":     safe_int(row.get("starts",8)),
+        "stars":      safe_int(row.get("stars",3)),
+        "awards_val": AWARD_MAP.get(str(row.get("awards","None")), 0),
+        "conf_val":   CONF_TIER_MAP.get(str(row.get("conference","Mid-Major")), 2),
+        "ig":         safe_int(row.get("ig_followers",0)),
+        "tt":         safe_int(row.get("tiktok_followers",0)),
+        "xf":         safe_int(row.get("twitter_followers",0)),
+        "eng":        safe_float(row.get("engagement_pct",2.0)),
+        "mSize":      SIZE_MAP.get(str(row.get("school_size","8,000–20,000")), 2),
+        "mTV":        TV_MAP.get(str(row.get("tv_exposure","Regional network")), 2),
+        "mMkt":       MKT_MAP.get(str(row.get("market_size","Mid-size market")), 2),
+        "rTransfer":  TRANSFER_MAP.get(str(row.get("transfer_risk","Low — committed")), 0),
+        "rDraft":     DRAFT_MAP.get(str(row.get("draft_risk","0 — Not projected")), 0),
+        "recruit_rank": RECRUIT_MAP.get(str(row.get("national_recruiting_rank","Unranked")), 0),
+        "draft_round":  DRAFT_MAP.get(str(row.get("draft_projection","0 — Not projected")), 0),
     }
 
 def make_sample_csv() -> bytes:
@@ -298,7 +332,8 @@ def radar_chart(p):
 
 def roster_bar_chart(df):
     df_s = df.sort_values("overall", ascending=True)
-    cmap = {"Elite":"#059669","High Value":"#2563eb","Developing":"#d97706","Entry Level":"#dc2626"}
+    cmap = {"Blue Chip":"#7c3aed","Elite":"#059669","High Value":"#2563eb",
+            "Developing":"#d97706","Entry Level":"#dc2626"}
     fig = go.Figure(go.Bar(
         x=df_s["overall"], y=df_s["name"], orientation="h",
         marker_color=[cmap.get(t,"#888") for t in df_s["tier"]],
@@ -312,13 +347,16 @@ def roster_bar_chart(df):
     return fig
 
 def nil_range_chart(df):
-    df_s = df.sort_values("overall",ascending=False).head(15)
+    df_s = df.sort_values("nil_hi",ascending=False).head(15)
     fig = go.Figure()
+    cmap = {"Blue Chip":"#7c3aed","Elite":"#059669","High Value":"#2563eb",
+            "Developing":"#d97706","Entry Level":"#dc2626"}
     for _, row in df_s.iterrows():
+        c = cmap.get(row["tier"],"#185FA5")
         fig.add_trace(go.Scatter(
             x=[row["nil_lo"],row["nil_hi"]], y=[row["name"],row["name"]],
-            mode="lines+markers", line=dict(width=6,color="#185FA5"),
-            marker=dict(size=10,color=["#B5D4F4","#185FA5"]),
+            mode="lines+markers", line=dict(width=6,color=c),
+            marker=dict(size=10,color=[c,c]),
             name=row["name"], showlegend=False,
         ))
     fig.update_layout(
@@ -330,7 +368,8 @@ def nil_range_chart(df):
     return fig
 
 def scatter_chart(df):
-    cmap = {"Elite":"#059669","High Value":"#2563eb","Developing":"#d97706","Entry Level":"#dc2626"}
+    cmap = {"Blue Chip":"#7c3aed","Elite":"#059669","High Value":"#2563eb",
+            "Developing":"#d97706","Entry Level":"#dc2626"}
     fig = px.scatter(
         df, x="soc", y="ath", size="overall", color="tier",
         hover_name="name",
@@ -350,6 +389,7 @@ def scatter_chart(df):
 # ─────────────────────────────────────────────────────────────────────────────
 
 TIER_HTML = {
+    "Blue Chip":   '<span class="bluechip">💎 Blue Chip</span>',
     "Elite":       '<span class="tier-elite">🏆 Elite</span>',
     "High Value":  '<span class="tier-high">⭐ High Value</span>',
     "Developing":  '<span class="tier-dev">📈 Developing</span>',
@@ -359,8 +399,11 @@ TIER_HTML = {
 def show_player_report(p):
     st.markdown(f"## {p['name']}  {TIER_HTML.get(p['tier'],'')}", unsafe_allow_html=True)
     st.caption(f"{p.get('pos','')}  ·  {p.get('sport','')}  ·  {p.get('year','')}  ·  {p.get('school','')}")
-    st.markdown("---")
 
+    if p["tier"] == "Blue Chip":
+        st.info(f"💎 **Blue Chip multiplier active** — Recruiting: {_rank_label(p.get('recruit_rank',0))} · Draft: {_draft_label(p.get('draft_round',0))}")
+
+    st.markdown("---")
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("Overall Score",   f"{p['overall']}/100")
     c2.metric("Athletic",        f"{p['ath']}/100")
@@ -370,7 +413,7 @@ def show_player_report(p):
 
     st.markdown(f"### 💰 Estimated NIL Value: `${p['nil_lo']:,} – ${p['nil_hi']:,}` / year")
     cap_pct = p['nil_hi'] / 20_500_000 * 100
-    st.caption(f"~{cap_pct:.2f}% of the $20.5M House settlement revenue-share cap (2025–26)")
+    st.caption(f"Fair-market floor estimate · ~{cap_pct:.2f}% of $20.5M House settlement cap · Bidding-war deals may exceed this range")
 
     col_r, col_i = st.columns([1,1])
     with col_r:
@@ -380,13 +423,13 @@ def show_player_report(p):
         total_soc = p.get("ig",0)+p.get("tt",0)+p.get("xf",0)
         start_rate = round(p.get("starts",0)/max(p.get("games",1),1)*100)
         rows = [
+            ("Recruiting Rank",  _rank_label(p.get("recruit_rank",0))),
+            ("Draft Projection", _draft_label(p.get("draft_round",0))),
             ("Social Reach",     f"{total_soc:,} followers · {p.get('eng',0):.1f}% engagement"),
             ("Start Rate",       f"{start_rate}%"),
             ("Transfer Risk",    ["Low ✅","Medium ⚠️","High 🚨"][p.get("rTransfer",0)]),
-            ("Draft Exposure",   ["Minimal","Moderate ⚠️","High 🚨"][p.get("rDraft",0)]),
             ("Recruiting Stars", "⭐"*p.get("stars",3)),
             ("Rev-Share %",      f"~{cap_pct:.2f}% of $20.5M cap"),
-            ("Compliance",       "Document fair market value for all deals"),
         ]
         for label, val in rows:
             st.markdown(f"**{label}:** {val}")
@@ -405,22 +448,20 @@ def show_player_report(p):
 
 def show_roster(df_scored):
     st.markdown("## 📋 Roster Value Overview")
-
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Players",           len(df_scored))
     c2.metric("Avg. Overall Score",      f"{df_scored['overall'].mean():.1f}")
-    c3.metric("Elite / High Value",      len(df_scored[df_scored["tier"].isin(["Elite","High Value"])]))
+    c3.metric("Blue Chip / Elite",       len(df_scored[df_scored["tier"].isin(["Blue Chip","Elite"])]))
     c4.metric("Total Roster NIL (high)", f"${df_scored['nil_hi'].sum():,.0f}")
 
     tabs = st.tabs(["📊 Rankings","🎯 NIL Ranges","🔬 Athletic vs Social","📄 Data Table"])
-
     with tabs[0]:
         st.plotly_chart(roster_bar_chart(df_scored), use_container_width=True)
     with tabs[1]:
         st.plotly_chart(nil_range_chart(df_scored), use_container_width=True)
     with tabs[2]:
         st.plotly_chart(scatter_chart(df_scored), use_container_width=True)
-        st.caption("Bubble size = overall score. Hover for details.")
+        st.caption("Bubble size = overall score. Purple = Blue Chip. Hover for details.")
     with tabs[3]:
         disp = df_scored[["name","school","sport","tier","overall","ath","soc","mkt","risk","nil_lo","nil_hi"]].copy()
         disp.columns = ["Name","School","Sport","Tier","Overall","Athletic","Social","Market","Risk","NIL Low","NIL High"]
@@ -468,7 +509,15 @@ def manual_form():
             mTV       = st.selectbox("TV/Streaming Exposure", list(TV_MAP.keys()))
             mMkt      = st.selectbox("Local Market Size",     list(MKT_MAP.keys()))
             rTransfer = st.selectbox("Transfer Risk",         list(TRANSFER_MAP.keys()))
-            rDraft    = st.selectbox("Draft Eligibility",     list(DRAFT_MAP.keys()))
+            rDraft    = st.selectbox("Draft Eligibility",     list(TRANSFER_MAP.keys()))
+
+        st.markdown("---")
+        st.markdown("**💎 Blue Chip Factors** — leave at defaults if not applicable")
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            recruit_rank_label = st.selectbox("National Recruiting Rank", list(RECRUIT_MAP.keys()))
+        with bc2:
+            draft_round_label  = st.selectbox("Draft Projection", list(DRAFT_MAP.keys()))
 
         submitted = st.form_submit_button("📊  Calculate Player Value", use_container_width=True)
 
@@ -479,7 +528,10 @@ def manual_form():
             "awards_val":AWARD_MAP[awards],"conf_val":CONF_TIER_MAP[conf],
             "ig":ig,"tt":tt,"xf":xf,"eng":eng,
             "mSize":SIZE_MAP[mSize],"mTV":TV_MAP[mTV],"mMkt":MKT_MAP[mMkt],
-            "rTransfer":TRANSFER_MAP[rTransfer],"rDraft":DRAFT_MAP[rDraft],
+            "rTransfer":TRANSFER_MAP[rTransfer],
+            "rDraft":DRAFT_MAP.get(rDraft, 0),
+            "recruit_rank": RECRUIT_MAP[recruit_rank_label],
+            "draft_round":  DRAFT_MAP[draft_round_label],
         }
     return None
 
@@ -494,13 +546,14 @@ def main():
         st.markdown("---")
         mode = st.radio("Mode", ["Single Player","Roster (CSV Upload)"], label_visibility="collapsed")
         st.markdown("---")
+        st.markdown("**💎 Blue Chip Model**")
         st.caption(
-            "Estimates NIL value and roster worth using athletic performance, "
-            "social reach, market opportunity, and retention risk — "
-            "aligned with the 2025–26 House settlement ($20.5M cap)."
+            "Now includes recruiting rank and draft projection multipliers. "
+            "Top-10 recruits and lottery picks can reach $500K–$2M+. "
+            "Estimates reflect fair-market floor — bidding wars may exceed this."
         )
         st.markdown("---")
-        st.caption("v1.0 · For internal AD use only")
+        st.caption("v2.0 · For internal AD use only")
 
     if mode == "Single Player":
         st.title("🏆 AVIP — Player Valuation")
@@ -531,15 +584,16 @@ def main():
                 st.markdown("---")
                 st.markdown("### Individual Reports")
                 for p in scored:
-                    with st.expander(f"{p['name']} — {p['tier']} ({p['overall']}/100)"):
+                    with st.expander(f"{p['name']} — {p['tier']} ({p['overall']}/100)  ·  ${p['nil_lo']:,}–${p['nil_hi']:,}"):
                         show_player_report(p)
             except Exception as e:
                 st.error(f"Error reading CSV: {e}. Please use the template format.")
         else:
-            st.info("👆 Download the template, fill it in, then upload it here.")
+            st.info("👆 Download the template, fill it in with your roster, then upload it here.")
             st.dataframe(
                 pd.DataFrame(SAMPLE_DATA, columns=COLUMNS)[
-                    ["name","school","sport","position","year","stars","ig_followers","tiktok_followers","engagement_pct"]
+                    ["name","school","sport","position","stars",
+                     "national_recruiting_rank","draft_projection","ig_followers","engagement_pct"]
                 ], hide_index=True
             )
 
